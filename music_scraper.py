@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-music_scraper.py — Multi-source music metadata collector for a recommendation system.
+music_scraper.py — Music metadata collector for a recommendation system.
 
 Sources
 -------
@@ -11,7 +11,6 @@ What it collects
   1. Track metadata      -> content-based features (title, artists, genre, duration, year)
   2. Playlist membership -> co-occurrence signal (the strongest free CF signal you can get)
   3. "Related track" edges -> item-item graph, ready for random-walk / ALS style models
-  4. Cross-source track matching -> merges the same song across the three catalogs
 
 Install
 -------
@@ -19,15 +18,12 @@ Install
 
 Usage
 -----
-    # Seed from charts on every source, then expand 2 hops through related tracks
+    # Seed from charts, then expand 2 hops through related tracks
     python music_scraper.py crawl --seed-charts --depth 2 --max-tracks 5000
 
     # Seed from your own search terms
     python music_scraper.py crawl \
         --queries "Sơn Tùng M-TP" "Hoàng Thùy Linh" "indie việt" --max-tracks 800
-
-    # Link the same song across sources
-    python music_scraper.py match --threshold 88
 
     # Emit training files for the recommender
     python music_scraper.py export --out ./dataset
@@ -387,7 +383,15 @@ class YouTubeMusicScraper(BaseScraper):
             raise RuntimeError("pip install ytmusicapi to use the YouTube Music source")
         # auth_file (browser.json from `ytmusicapi browser`) unlocks library/history
         # endpoints — great for building real user-item interaction data.
-        self.client = YTMusic(auth_file) if auth_file and Path(auth_file).exists() else YTMusic()
+        if auth_file and Path(auth_file).exists():
+            LOG.info("[ytm] using authenticated session: %s", auth_file)
+            self.client = YTMusic(auth_file)
+        else:
+            LOG.warning(
+                "[ytm] no browser authentication found; "
+                "top-song charts may be unavailable"
+            )
+            self.client = YTMusic()
 
         self.youtube_api_key = YoutubeConfig.API_KEY
 
@@ -542,19 +546,172 @@ class YouTubeMusicScraper(BaseScraper):
 
     def chart_tracks(self, limit: int = 100) -> list[Track]:
         out: list[Track] = []
+        seen: set[str] = set()
+
+        def add_track(item: dict) -> None:
+            if not isinstance(item, dict):
+                return
+
+            t = self._to_track(item)
+            if t and t.uid not in seen:
+                seen.add(t.uid)
+                out.append(t)
+
+        def extract_items(section: Any) -> list[dict]:
+            """Normalize the various chart response shapes."""
+            if not section:
+                return []
+
+            if isinstance(section, list):
+                return [x for x in section if isinstance(x, dict)]
+
+            if isinstance(section, dict):
+                items = section.get("items")
+                if isinstance(items, list):
+                    return [x for x in items if isinstance(x, dict)]
+
+            return []
+
+        def extract_playlist_ids(section: Any) -> list[str]:
+            """Find playlist IDs in a chart section."""
+            ids: list[str] = []
+
+            if isinstance(section, dict):
+                # Older/current responses can expose one playlist directly.
+                for key in ("playlist", "playlistId"):
+                    value = section.get(key)
+                    if isinstance(value, str) and value:
+                        ids.append(value)
+
+                # Or expose chart playlist entries under items.
+                items = section.get("items")
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+
+                        for key in ("playlistId", "browseId"):
+                            value = item.get(key)
+                            if isinstance(value, str) and value:
+                                # browseId can be VL<playlist-id>
+                                if value.startswith("VL"):
+                                    value = value[2:]
+                                ids.append(value)
+
+            elif isinstance(section, list):
+                for item in section:
+                    if not isinstance(item, dict):
+                        continue
+
+                    for key in ("playlistId", "browseId"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value:
+                            if value.startswith("VL"):
+                                value = value[2:]
+                            ids.append(value)
+
+            return list(dict.fromkeys(ids))
+
         for country in YTM_CHART_COUNTRIES:
             self.limiter.wait()
             try:
                 charts = self.client.get_charts(country=country)
+
+                if not isinstance(charts, dict):
+                    LOG.warning(
+                        "[ytm] charts %s returned unexpected type: %s",
+                        country,
+                        type(charts).__name__,
+                    )
+                    continue
+
+                LOG.debug(
+                    "[ytm] chart %s sections: %s",
+                    country,
+                    list(charts.keys()),
+                )
+
+                # ------------------------------------------------------------------
+                # 1. Direct song charts
+                # ------------------------------------------------------------------
+                songs = charts.get("songs")
+
+                for item in extract_items(songs):
+                    add_track(item)
+
+                # ------------------------------------------------------------------
+                # 2. Video chart entries
+                #
+                # Some ytmusicapi versions return individual video/song items.
+                # Others return chart playlist metadata.
+                # ------------------------------------------------------------------
+                videos = charts.get("videos")
+
+                for item in extract_items(videos):
+                    # If this is already a track, keep it.
+                    if item.get("videoId") or item.get("id"):
+                        add_track(item)
+
+                # ------------------------------------------------------------------
+                # 3. Resolve chart playlists.
+                # ------------------------------------------------------------------
+                playlist_ids = []
+
+                for section_name in ("songs", "videos", "trending", "genres"):
+                    playlist_ids.extend(
+                        extract_playlist_ids(charts.get(section_name))
+                    )
+
+                # Remove duplicates while preserving order.
+                playlist_ids = list(dict.fromkeys(playlist_ids))
+
+                for playlist_id in playlist_ids:
+                    if len(out) >= limit:
+                        break
+
+                    try:
+                        self.limiter.wait()
+
+                        playlist = self.client.get_playlist(
+                            playlist_id,
+                            limit=max(100, limit - len(out)),
+                        )
+
+                        for item in playlist.get("tracks", []):
+                            if len(out) >= limit:
+                                break
+
+                            add_track(item)
+
+                    except Exception as exc:
+                        LOG.warning(
+                            "[ytm] chart playlist %s failed: %s",
+                            playlist_id,
+                            exc,
+                        )
+
+                # ------------------------------------------------------------------
+                # 4. Some versions expose useful chart items directly in
+                #    "trending".
+                # ------------------------------------------------------------------
+                trending = charts.get("trending")
+
+                for item in extract_items(trending):
+                    if len(out) >= limit:
+                        break
+                    add_track(item)
+
+                if out:
+                    break
+
             except Exception as exc:
-                LOG.warning("[ytm] charts %s failed: %s", country, exc)
-                continue
-            for bucket in ("songs", "videos", "trending"):
-                section = charts.get(bucket) or {}
-                for item in (section.get("items") if isinstance(section, dict) else section) or []:
-                    t = self._to_track(item)
-                    if t:
-                        out.append(t)
+                LOG.warning(
+                    "[ytm] charts %s failed: %s",
+                    country,
+                    exc,
+                )
+
+        LOG.info("[ytm] collected %d chart tracks", len(out))
         return self._enrich_statistics(out[:limit])
 
     def related_tracks(self, track: Track, limit: int = 20) -> list[Track]:
